@@ -1,0 +1,6 @@
+full_name,email,phone,country,amount
+Alice Johnson, Alice.Johnson@Example.COM ,(415) 555-0100,us,120.50
+Bob Smith,BOB@example.com,415.555.0111,us,89.00
+Carlos Mendez,carlos@example.mx,+52 55 1234 5678,mx,240.00
+Dana Lee, dana.lee@example.com,5105550123,us,15.75
+Emil Novak,emil@example.cz, ,cz,320.20
