@@ -16,8 +16,19 @@ determinism**.
 | Lane | Module | LLM used for | LLM at scale? |
 |------|--------|--------------|---------------|
 | **Compiler ETL** | `compiler.py`, `runner.py` | Turn English rule → pandas code (once, cached) | ❌ never |
-| **Runtime extraction** | `runtime_llm.py` | Unstructured text → structured JSON (batched) | ⚠️ only for text that can't be ruled |
+| **Runtime extraction (sync)** | `runtime_llm.py` | Unstructured text → structured JSON | ⚠️ only for text that can't be ruled |
+| **Runtime extraction (batch)** | `batch.py` | Same, via **Bedrock Batch Inference** (async, ~50% cheaper) | ⚠️ batch quota, not online |
 | **NL query frontend** | `api.py`, `frontend/` | Question → query plan (pandas executes it) | ❌ never per-row |
+
+**Rule library** (compiled deterministically): phone→E.164, split name, email
+normalize, uppercase, dropna, **dedup**, **numeric coercion**, **currency→USD**,
+plus **`join_lookup`** for multi-table enrichment.
+
+**NL query ops**: count, avg, **sum**, **min/max**, top-N, **filter**, group-by.
+
+The real `BedrockLLM` adds **throttling-aware retry** (exponential backoff +
+jitter) and **prompt caching** on the system prompt — the correct way to handle
+Bedrock quotas when you *do* call the model.
 
 ## Quickstart (no AWS account needed)
 
@@ -97,6 +108,26 @@ Q: "Group customers by country"    →  {"US": 3, "CZ": 1, "MX": 1}
 The LLM compiles the question into a small JSON query plan; pandas runs it. The
 model never renders the page and never sees the rows on each request.
 
+## Example: high-volume extraction via Bedrock Batch Inference
+
+```python
+from llm_etl import run_batch, OfflineBatchBackend, BedrockBatchBackend
+
+# offline (default) — simulates the full submit/poll/results lifecycle
+run_batch(notes, schema)
+
+# real Bedrock at volume — async job against the cheaper batch quota
+backend = BedrockBatchBackend(
+    s3_uri="s3://my-bucket/llm-etl", role_arn="arn:aws:iam::…:role/BedrockBatch"
+)
+job = backend.submit(notes, schema)
+backend.wait(job)                 # polls until Completed
+records = backend.results(job)    # parses output JSONL from S3
+```
+
+Use this instead of looping synchronous calls once you have thousands of records
+— it runs as one async job on a separate, higher quota (~50% cheaper).
+
 ## Layout
 
 ```
@@ -105,8 +136,9 @@ src/llm_etl/
   config.py       # provider selection via env var
   compiler.py     # rule -> pandas code, validated & cached  (the core idea)
   sandbox.py      # restricted execution of generated code
-  runner.py       # extract / transform (Pipeline) / load
-  runtime_llm.py  # unstructured text -> structured JSON (batch)
+  runner.py       # extract / transform (Pipeline) / load / join_lookup
+  runtime_llm.py  # unstructured text -> structured JSON (synchronous)
+  batch.py        # Bedrock Batch Inference lifecycle (+ offline simulation)
   api.py          # FastAPI NL-query endpoint
 frontend/index.html   # minimal static UI for the query endpoint
 examples/             # demo data + run_demo.py

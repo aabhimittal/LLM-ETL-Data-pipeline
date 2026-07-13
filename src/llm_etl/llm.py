@@ -14,7 +14,9 @@ change in :mod:`llm_etl.config`.
 from __future__ import annotations
 
 import json
+import random
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -47,7 +49,12 @@ class BedrockLLM:
     region: str = "us-east-1"
     max_tokens: int = 2048
     temperature: float = 0.0
+    max_retries: int = 5
+    prompt_cache: bool = True
     _client: Any = field(default=None, repr=False)
+
+    # Bedrock error codes that are safe to retry with backoff.
+    _RETRYABLE = ("ThrottlingException", "TooManyRequestsException", "ServiceUnavailableException")
 
     def _lazy_client(self):
         if self._client is None:
@@ -56,11 +63,37 @@ class BedrockLLM:
             self._client = boto3.client("bedrock-runtime", region_name=self.region)
         return self._client
 
-    def complete(self, system: str, user: str, *, tool: dict | None = None) -> str:
+    def _converse(self, **kwargs: Any) -> dict:
+        """Call Converse with exponential backoff on throttling.
+
+        This is the correct answer to Bedrock rate limits when you *do* call the
+        model: bounded retries with jitter, not a per-row firehose. The compiler
+        pattern means we reach this path rarely (once per rule / per batch item).
+        """
+        from botocore.exceptions import ClientError
+
         client = self._lazy_client()
+        for attempt in range(self.max_retries + 1):
+            try:
+                return client.converse(**kwargs)
+            except ClientError as exc:
+                code = exc.response.get("Error", {}).get("Code", "")
+                if code not in self._RETRYABLE or attempt == self.max_retries:
+                    raise
+                sleep = min(2 ** attempt, 30) + random.uniform(0, 0.5)
+                time.sleep(sleep)
+        raise RuntimeError("unreachable")  # pragma: no cover
+
+    def complete(self, system: str, user: str, *, tool: dict | None = None) -> str:
+        system_blocks: list[dict] = [{"text": system}]
+        if self.prompt_cache:
+            # Cache the (large, stable) system prompt so repeated compiles only
+            # pay for it once - a direct cost lever for high-volume rule sets.
+            system_blocks.append({"cachePoint": {"type": "default"}})
+
         kwargs: dict[str, Any] = {
             "modelId": self.model_id,
-            "system": [{"text": system}],
+            "system": system_blocks,
             "messages": [{"role": "user", "content": [{"text": user}]}],
             "inferenceConfig": {
                 "maxTokens": self.max_tokens,
@@ -73,7 +106,7 @@ class BedrockLLM:
                 "toolChoice": {"tool": {"name": tool["name"]}},
             }
 
-        resp = client.converse(**kwargs)
+        resp = self._converse(**kwargs)
         content = resp["output"]["message"]["content"]
         if tool is not None:
             for block in content:
@@ -124,8 +157,33 @@ class OfflineLLM:
             lines += [f"    df['{col}'] = df['{col}'].astype(str).str.upper()"]
         if "email" in rule and ("lower" in rule or "normal" in rule):
             lines += ["    df['email'] = df['email'].astype(str).str.strip().str.lower()"]
-        if "drop" in rule and "null" in rule or "dropna" in rule:
+        if ("drop" in rule and "null" in rule) or "dropna" in rule:
             lines += ["    df = df.dropna()"]
+        if "dedup" in rule or "duplicate" in rule or "distinct" in rule or "unique" in rule:
+            col = _first_col_after(rule, "on") or _first_col_after(rule, "by")
+            subset = f"subset=['{col}']" if col else ""
+            lines += [f"    df = df.drop_duplicates({subset}).reset_index(drop=True)"]
+        if ("convert" in rule or "coerce" in rule or "cast" in rule) and (
+            "numeric" in rule or "number" in rule or "int" in rule or "float" in rule
+        ):
+            col = _target_col(rule) or "amount"
+            caster = "int" if "int" in rule else "float"
+            lines += [
+                f"    df['{col}'] = pd.to_numeric(df['{col}'], errors='coerce')",
+            ]
+            if caster == "int":
+                lines += [f"    df['{col}'] = df['{col}'].astype('Int64')"]
+        if "currency" in rule or ("convert" in rule and ("usd" in rule or "eur" in rule)):
+            # static demo FX table -> normalize an amount column to USD
+            lines += [
+                "    _fx = {'USD': 1.0, 'EUR': 1.08, 'GBP': 1.27, 'MXN': 0.058, 'CZK': 0.043}",
+                "    def _to_usd(row):",
+                "        cur = str(row.get('currency', 'USD')).upper()",
+                "        amt = pd.to_numeric(row.get('amount'), errors='coerce')",
+                "        rate = _fx.get(cur, 1.0)",
+                "        return round(amt * rate, 2) if amt == amt else None",
+                "    df['amount_usd'] = df.apply(_to_usd, axis=1)",
+            ]
 
         if len(lines) == 2:  # nothing matched -> safe identity transform
             lines += ["    # (offline stub: rule not recognized -> identity)"]
@@ -158,6 +216,11 @@ class OfflineLLM:
     # ---- natural-language question -> pandas query expr (frontend) ----- #
     def _nl_query(self, user: str) -> str:
         q = user.lower()
+
+        def amount_col() -> str:
+            # "amount_usd" / "in usd" -> the converted column, else raw amount
+            return "amount_usd" if "amount_usd" in q or "usd" in q else "amount"
+
         # order matters: check group/top/avg before the generic count fallback,
         # and match "count" as a whole word so "country" doesn't trip it.
         if "group" in q or "by country" in q or "per country" in q:
@@ -165,11 +228,22 @@ class OfflineLLM:
         if "top" in q or "highest" in q or "most" in q:
             m = re.search(r"top\s+(\d+)", q)
             n = int(m.group(1)) if m else 5
-            by = "amount" if "amount" in q or "spend" in q or "spent" in q else None
+            by = amount_col() if "amount" in q or "spend" in q or "spent" in q else None
             return json.dumps({"op": "top", "n": n, "by": by})
         if "average" in q or "mean" in q or re.search(r"\bavg\b", q):
-            col = "amount" if "amount" in q or "spend" in q else None
+            col = amount_col() if "amount" in q or "spend" in q else None
             return json.dumps({"op": "avg", "col": col})
+        if "total" in q or re.search(r"\bsum\b", q):
+            col = amount_col() if "amount" in q or "spend" in q or "spent" in q else None
+            return json.dumps({"op": "sum", "col": col})
+        if "lowest" in q or "minimum" in q or re.search(r"\bmin\b", q):
+            return json.dumps({"op": "extreme", "which": "min", "col": amount_col()})
+        if "maximum" in q or re.search(r"\bmax\b", q) or "largest" in q:
+            return json.dumps({"op": "extreme", "which": "max", "col": amount_col()})
+        # "customers in US" / "where country is MX"
+        m = re.search(r"\b(?:in|from|where country (?:is|=)?)\s+([a-z]{2})\b", q)
+        if m and ("customer" in q or "show" in q or "list" in q or "where" in q):
+            return json.dumps({"op": "filter", "col": "country", "eq": m.group(1).upper()})
         if "how many" in q or re.search(r"\bcount\b", q) or "number of" in q:
             return json.dumps({"op": "count"})
         return json.dumps({"op": "head", "n": 5})
@@ -187,3 +261,22 @@ class OfflineLLM:
 def _first_col_after(rule: str, keyword: str) -> str | None:
     m = re.search(keyword + r"\s+(?:the\s+)?(\w+)", rule)
     return m.group(1) if m else None
+
+
+_STOPWORDS = {"the", "a", "an", "to", "column", "field", "into", "as", "of", "value", "values"}
+
+
+def _target_col(rule: str) -> str | None:
+    """Best-effort column name for a rule like 'convert the amount column to int'.
+
+    Tries '<col> column' first, then the first meaningful word after the verb.
+    """
+    m = re.search(r"(\w+)\s+column", rule)
+    if m and m.group(1) not in _STOPWORDS:
+        return m.group(1)
+    m = re.search(r"(?:convert|coerce|cast)\s+((?:\w+\s+)*?\w+)", rule)
+    if m:
+        for word in m.group(1).split():
+            if word not in _STOPWORDS:
+                return word
+    return None

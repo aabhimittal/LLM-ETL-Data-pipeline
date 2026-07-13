@@ -3,6 +3,7 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 .rule_cache/
+.batch_jobs/
 .venv/
 venv/
 data/*.csv
