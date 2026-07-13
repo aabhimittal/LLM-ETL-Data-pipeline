@@ -24,8 +24,11 @@ dataset into a JSON query plan (this is the nl-query compiler). Respond with
 ONLY JSON, one of:
   {"op":"count"}
   {"op":"avg","col":"<column>"}
+  {"op":"sum","col":"<column>"}
+  {"op":"extreme","which":"min|max","col":"<column>"}
   {"op":"top","n":<int>,"by":"<column>"}
   {"op":"group","by":"<column>","agg":"count"}
+  {"op":"filter","col":"<column>","eq":"<value>"}
   {"op":"head","n":<int>}
 """
 
@@ -46,11 +49,27 @@ def execute_plan(df: pd.DataFrame, plan: dict) -> dict:
     op = plan.get("op")
     if op == "count":
         return {"answer": int(len(df)), "plan": plan}
-    if op == "avg":
+    if op in ("avg", "sum"):
         col = plan.get("col")
         if col not in df.columns:
             return {"error": f"unknown column {col!r}", "plan": plan}
-        return {"answer": float(pd.to_numeric(df[col], errors="coerce").mean()), "plan": plan}
+        series = pd.to_numeric(df[col], errors="coerce")
+        value = series.mean() if op == "avg" else series.sum()
+        return {"answer": float(value), "plan": plan}
+    if op == "extreme":
+        col = plan.get("col")
+        which = plan.get("which", "max")
+        if col not in df.columns:
+            return {"error": f"unknown column {col!r}", "plan": plan}
+        series = pd.to_numeric(df[col], errors="coerce")
+        idx = series.idxmin() if which == "min" else series.idxmax()
+        return {"answer": _records(df.loc[[idx]])[0], "plan": plan}
+    if op == "filter":
+        col = plan.get("col")
+        if col not in df.columns:
+            return {"error": f"unknown column {col!r}", "plan": plan}
+        rows = df[df[col].astype(str) == str(plan.get("eq"))]
+        return {"answer": _records(rows), "count": int(len(rows)), "plan": plan}
     if op == "top":
         by = plan.get("by")
         n = int(plan.get("n", 5))

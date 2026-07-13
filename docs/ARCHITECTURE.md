@@ -39,11 +39,15 @@ from a plain-English rule, then run that code at scale with no LLM in the loop.
    structured/semi-structured data with rules that *can* be expressed as code.
    Rules compile once, cache to disk, and run deterministically.
 
-2. **Runtime batch extraction** (`runtime_llm.py`) — the narrow escape hatch for
-   genuinely unstructured input (free text, emails, OCR'd docs) where no
-   deterministic rule exists. Uses tool-use for structured JSON output and
-   processes in batches. For high volume, back it with **Bedrock Batch
-   Inference** (async, ~50% cheaper, separate quota).
+2. **Runtime extraction** (`runtime_llm.py`, `batch.py`) — the narrow escape
+   hatch for genuinely unstructured input (free text, emails, OCR'd docs) where
+   no deterministic rule exists. Uses tool-use for structured JSON output.
+   - *Synchronous* (`runtime_llm.extract_batch`) for small volumes.
+   - *Asynchronous* (`batch.BedrockBatchBackend`) for high volume: writes a
+     JSONL manifest to S3 and runs one **Bedrock Batch Inference** job against a
+     separate, higher quota (~50% cheaper) instead of hammering the online RPM
+     limit. `OfflineBatchBackend` simulates the identical submit→poll→results
+     lifecycle on local disk so it's fully testable with no AWS.
 
 3. **Natural-language query API** (`api.py`, `frontend/index.html`) — the
    frontend lane. The LLM *compiles* a question into a small query plan; pandas
@@ -62,6 +66,21 @@ implementations:
   exactly the code/JSON a well-prompted Claude would.
 
 Switching is one env var — no code changes.
+
+### Handling Bedrock quotas when you *do* call the model
+
+`BedrockLLM` is built for the reality of Bedrock limits:
+
+- **Throttling-aware retry** — `ThrottlingException` / `TooManyRequestsException`
+  are retried with exponential backoff + jitter (bounded by `max_retries`),
+  rather than failing the pipeline or hammering the endpoint.
+- **Prompt caching** — a `cachePoint` after the (large, stable) system prompt so
+  repeated rule compilations don't re-pay for it.
+- **Batch over online** — for volume, `batch.py` uses the async Batch Inference
+  quota instead of the online RPM/TPM quota.
+
+Because of the compiler pattern, we hit this path rarely (once per rule, once per
+batch) — so these are safety nets, not the load-bearing throughput mechanism.
 
 ## Safety
 

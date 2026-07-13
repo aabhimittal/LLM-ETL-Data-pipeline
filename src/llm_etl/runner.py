@@ -37,6 +37,26 @@ def load_records(df: pd.DataFrame) -> list[dict]:
     return df.to_dict(orient="records")
 
 
+def join_lookup(
+    df: pd.DataFrame,
+    lookup: pd.DataFrame,
+    *,
+    on: str,
+    how: str = "left",
+) -> pd.DataFrame:
+    """Enrich ``df`` by joining a lookup/dimension table on ``on``.
+
+    Joins are deterministic set operations, so they belong in code, not in a
+    per-row LLM call. The compiler handles single-table rules; this handles the
+    multi-table (enrichment) case.
+    """
+    if on not in df.columns:
+        raise KeyError(f"join key {on!r} not in left frame")
+    if on not in lookup.columns:
+        raise KeyError(f"join key {on!r} not in lookup frame")
+    return df.merge(lookup, on=on, how=how)
+
+
 # ------------------------------- pipeline ---------------------------------- #
 @dataclass
 class Pipeline:
